@@ -80,6 +80,9 @@ const G = {
   mouse: { x: 0, y: 0, down: false },
   keys: {},
   drag: null,
+  touch: { left: false, right: false, fire: false },
+  touchButtons: [],
+  activePointers: {},
   aim: { angle: 58, power: 62 },
   uiButtons: [],
   readyAt: -1,
@@ -112,6 +115,10 @@ function fitCanvas() {
 }
 window.addEventListener('resize', fitCanvas);
 fitCanvas();
+
+// Touch devices get on-screen walk/jump/fire buttons; desktop keeps
+// mouse + keyboard only and never sees them.
+const IS_TOUCH = ('ontouchstart' in window) || (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0);
 
 function canvasPos(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
@@ -776,21 +783,60 @@ function togglePause() {
   else if (G.screen === 'paused') { G.screen = 'playing'; Sfx.play('ui'); }
 }
 
-canvas.addEventListener('mousemove', function (e) {
-  const p = canvasPos(e.clientX, e.clientY);
-  G.mouse.x = p.x;
-  G.mouse.y = p.y;
-  if (G.drag) updateDragAim();
-});
+// Pointer input: mouse, touch and pen share one path. Touch controls are
+// hit first, then UI buttons, then targeting clicks, then a slingshot drag.
+// Pointer capture keeps a drag alive outside the canvas; pointercancel
+// drops the drag without firing. Each pointer is tracked by id so two
+// thumbs (hold-to-walk + fire) work at the same time.
+function hitTouchButton(p) {
+  for (let i = G.touchButtons.length - 1; i >= 0; i--) {
+    const b = G.touchButtons[i];
+    if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) return b;
+  }
+  return null;
+}
 
-canvas.addEventListener('mousedown', function (e) {
+function pressTouchButton(b) {
+  if (b.role === 'left') G.touch.left = true;
+  else if (b.role === 'right') G.touch.right = true;
+  else if (b.role === 'jump') {
+    if (G.phase === 'aim' && G.activeAnt && G.stamina >= JUMP_COST && G.activeAnt.jump()) {
+      G.stamina -= JUMP_COST;
+      Sfx.play('jump');
+    }
+  } else if (b.role === 'fire') {
+    G.touch.fire = true;
+    if (canFire()) fire(G.aim.angle, G.aim.power, G.selectedWeapon);
+  }
+}
+
+function releaseTouchButton(role) {
+  if (role === 'left') G.touch.left = false;
+  else if (role === 'right') G.touch.right = false;
+  else if (role === 'fire') G.touch.fire = false;
+}
+
+function capturePointer(e) {
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture unavailable: the drag still works inside the canvas */ }
+}
+
+canvas.addEventListener('pointerdown', function (e) {
   if (e.button !== 0) return;
+  e.preventDefault();
   Sfx.unlock();
   const p = canvasPos(e.clientX, e.clientY);
   G.mouse.x = p.x;
   G.mouse.y = p.y;
   G.mouse.down = true;
-  // Buttons first (registered during the last draw).
+  // Touch controls first: a tap on one must never start a drag-aim.
+  const tb = hitTouchButton(p);
+  if (tb) {
+    G.activePointers[e.pointerId] = tb.role;
+    capturePointer(e);
+    pressTouchButton(tb);
+    return;
+  }
+  // Buttons next (registered during the last draw).
   for (let i = G.uiButtons.length - 1; i >= 0; i--) {
     const b = G.uiButtons[i];
     if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
@@ -805,23 +851,51 @@ canvas.addEventListener('mousedown', function (e) {
     useItem(G.selectedItem, p.x, p.y);
     return;
   }
-  G.drag = { sx: p.x, sy: p.y, x: p.x, y: p.y };
+  if (G.drag) return; // one drag at a time; extra pointers are ignored
+  G.activePointers[e.pointerId] = 'drag';
+  capturePointer(e);
+  G.drag = { sx: p.x, sy: p.y, x: p.x, y: p.y, pointerId: e.pointerId };
 });
 
-canvas.addEventListener('mouseup', function (e) {
-  G.mouse.down = false;
-  if (!G.drag) return;
+canvas.addEventListener('pointermove', function (e) {
+  const p = canvasPos(e.clientX, e.clientY);
+  G.mouse.x = p.x;
+  G.mouse.y = p.y;
+  if (G.drag && e.pointerId === G.drag.pointerId) {
+    e.preventDefault();
+    G.drag.x = p.x;
+    G.drag.y = p.y;
+    updateDragAim();
+  }
+});
+
+function endPointer(e, cancelled) {
+  const role = G.activePointers[e.pointerId];
+  delete G.activePointers[e.pointerId];
+  if (Object.keys(G.activePointers).length === 0) G.mouse.down = false;
+  if (role === 'left' || role === 'right' || role === 'fire') {
+    releaseTouchButton(role);
+    return;
+  }
+  if (!G.drag || e.pointerId !== G.drag.pointerId) return;
   const dx = G.drag.sx - G.drag.x;
   const dy = G.drag.sy - G.drag.y;
   const mag = Math.hypot(dx, dy);
   G.drag = null;
+  if (cancelled) return;
   if (G.screen !== 'playing' || G.phase !== 'aim' || G.turn !== 'amber') return;
   if (mag >= 24 && canFire()) {
     fire(G.aim.angle, G.aim.power, G.selectedWeapon);
   }
-});
+}
 
-canvas.addEventListener('mouseleave', function () { G.mouse.down = false; G.drag = null; });
+canvas.addEventListener('pointerup', function (e) { endPointer(e, false); });
+canvas.addEventListener('pointercancel', function (e) { endPointer(e, true); });
+canvas.addEventListener('pointerleave', function (e) {
+  // With capture this fires only after release (drag already null); without
+  // capture it cancels a drag that left the canvas, as before.
+  if (G.drag && e.pointerId === G.drag.pointerId) endPointer(e, true);
+});
 canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 
 canvas.addEventListener('wheel', function (e) {
@@ -911,8 +985,8 @@ function updateAimInput(dt) {
   const ant = G.activeAnt;
   if (!ant || !ant.alive || G.turn !== 'amber') return;
   let move = 0;
-  if (G.keys.left) move -= 1;
-  if (G.keys.right) move += 1;
+  if (G.keys.left || G.touch.left) move -= 1;
+  if (G.keys.right || G.touch.right) move += 1;
   if (move !== 0 && G.stamina > 0) {
     const maxMove = G.stamina / WALK_DRAIN;
     const want = 115 * dt;
@@ -1156,17 +1230,42 @@ function drawTrajectory() {
   const weapon = weaponById(G.selectedWeapon);
   const muzzle = ant.muzzle();
   const sim = simulateShot(muzzle.x, muzzle.y, G.aim.angle, G.aim.power, ant.facing, G.wind, weapon, G.terrain, G.ants, ant);
+  // Thick direction arrow from the muzzle along the aim angle, so the shot
+  // direction reads at a glance even on a small phone screen.
+  const aimRad = G.aim.angle * Math.PI / 180;
+  const ax = ant.facing * Math.cos(aimRad);
+  const ay = -Math.sin(aimRad);
+  const ax0 = muzzle.x + ax * 16, ay0 = muzzle.y + ay * 16;
+  const ax1 = muzzle.x + ax * 60, ay1 = muzzle.y + ay * 60;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(28,17,8,0.8)';
+  ctx.lineWidth = 9;
+  ctx.beginPath(); ctx.moveTo(ax0, ay0); ctx.lineTo(ax1, ay1); ctx.stroke();
+  ctx.strokeStyle = '#ffd166';
+  ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(ax0, ay0); ctx.lineTo(ax1, ay1); ctx.stroke();
+  const px2 = -ay, py2 = ax;
+  ctx.fillStyle = '#ffd166';
+  ctx.strokeStyle = 'rgba(28,17,8,0.8)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(ax1 + ax * 13, ay1 + ay * 13);
+  ctx.lineTo(ax1 + px2 * 8 - ax * 2, ay1 + py2 * 8 - ay * 2);
+  ctx.lineTo(ax1 - px2 * 8 - ax * 2, ay1 - py2 * 8 - ay * 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
   ctx.fillStyle = 'rgba(255,255,255,0.9)';
   for (let i = 0; i < sim.points.length; i += 2) {
     const p = sim.points[i];
     const fade = 1 - i / sim.points.length;
-    ctx.globalAlpha = 0.35 + fade * 0.55;
+    ctx.globalAlpha = 0.45 + fade * 0.55;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(28,17,8,0.65)';
+    ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(28,17,8,0.7)';
     ctx.fill();
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(255,255,255,0.95)';
     ctx.fill();
   }
@@ -1175,13 +1274,13 @@ function drawTrajectory() {
     const hx = sim.hit.kind === 'ant' ? sim.hit.ant.x : sim.hit.x;
     const hy = sim.hit.kind === 'ant' ? sim.hit.ant.y - 18 : sim.hit.y;
     ctx.strokeStyle = '#ffd166';
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 3.5;
     ctx.beginPath();
-    ctx.arc(hx, hy, 10, 0, Math.PI * 2);
+    ctx.arc(hx, hy, 12, 0, Math.PI * 2);
     ctx.stroke();
     ctx.beginPath();
-    ctx.moveTo(hx - 6, hy - 6); ctx.lineTo(hx + 6, hy + 6);
-    ctx.moveTo(hx + 6, hy - 6); ctx.lineTo(hx - 6, hy + 6);
+    ctx.moveTo(hx - 7, hy - 7); ctx.lineTo(hx + 7, hy + 7);
+    ctx.moveTo(hx + 7, hy - 7); ctx.lineTo(hx - 7, hy + 7);
     ctx.stroke();
   }
   // Aiming readout pill near the muzzle.
@@ -1359,6 +1458,54 @@ function drawMinimap() {
   drawText('200px', mx + mw - 8, sy - 5, 9, 'rgba(255,255,255,0.7)', 'right');
 }
 
+// On-screen touch controls: thumb-sized walk/jump/fire buttons, drawn only
+// on touch devices during the player's aim phase. They sit above the bottom
+// bar and clear of the panels, minimap and wind gauge.
+function drawTouchControls() {
+  if (!IS_TOUCH) return;
+  if (G.screen !== 'playing' || G.showHelp) return;
+  if (G.phase !== 'aim' || G.turn !== 'amber' || G.targeting) return;
+  const defs = [
+    { role: 'left', x: 16, y: 566, w: 58, h: 58 },
+    { role: 'right', x: 82, y: 566, w: 58, h: 58 },
+    { role: 'jump', x: 148, y: 566, w: 58, h: 58 },
+    { role: 'fire', x: 1140, y: 556, w: 124, h: 66 }
+  ];
+  for (const d of defs) {
+    const pressed = d.role === 'left' ? G.touch.left : d.role === 'right' ? G.touch.right : d.role === 'fire' ? G.touch.fire : false;
+    ctx.fillStyle = pressed ? 'rgba(255,209,102,0.5)' : 'rgba(24,16,9,0.6)';
+    roundRect(d.x, d.y, d.w, d.h, 12);
+    ctx.fill();
+    ctx.strokeStyle = pressed ? '#ffd166' : 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    const cx = d.x + d.w / 2, cy = d.y + d.h / 2;
+    if (d.role === 'left' || d.role === 'right') {
+      const dir = d.role === 'left' ? -1 : 1;
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(cx + dir * 12, cy - 13);
+      ctx.lineTo(cx + dir * 12, cy + 13);
+      ctx.lineTo(cx - dir * 12, cy);
+      ctx.closePath();
+      ctx.fill();
+    } else if (d.role === 'jump') {
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(cx - 11, cy - 2);
+      ctx.lineTo(cx, cy - 13);
+      ctx.lineTo(cx + 11, cy - 2);
+      ctx.stroke();
+      drawText('JUMP', cx, cy + 20, 11, '#ffffff', 'center', 'bold', false);
+    } else {
+      drawText('FIRE', cx, cy + 7, 22, '#ffd166', 'center', 'bold', false);
+    }
+    G.touchButtons.push({ x: d.x, y: d.y, w: d.w, h: d.h, role: d.role });
+  }
+}
+
 function drawHud() {
   // Top bar.
   ctx.fillStyle = 'rgba(24,16,9,0.72)';
@@ -1477,7 +1624,8 @@ function drawHud() {
     if (G.phase === 'aim' && G.turn === 'amber') endTurn();
   }, { fontSize: 15 });
   // Help hint, kept inside the canvas.
-  drawText('Drag to aim · H for help', 1272, 712, 11, 'rgba(255,255,255,0.6)', 'right');
+  drawText(IS_TOUCH ? 'Drag to aim · Tap FIRE to shoot' : 'Drag to aim · H for help', 1272, 712, 11, 'rgba(255,255,255,0.6)', 'right');
+  drawTouchControls();
   // Turn banner.
   if (G.banner) {
     const a = Math.min(1, G.banner.timer * 2);
@@ -1591,7 +1739,8 @@ function drawHowTo() {
     ['ITEMS', 'Crates parachute down with items: Double Shot, Triple Split, Frost Nectar, Leaf Glider, Repair Nectar.'],
     ['RAGE', 'Dealing and taking damage fills the rage bar. At full, unleash Rage Burst for massive damage.'],
     ['CONTROLS', 'Mouse: drag to aim, click trays and buttons. Keys: Arrows/WASD move + aim, Q/E power, Space fire,'],
-    ['', 'J jump, F flip facing, 1-6 weapons, Tab + U items, Enter end turn, P pause, M mute, H help.']
+    ['', 'J jump, F flip facing, 1-6 weapons, Tab + U items, Enter end turn, P pause, M mute, H help.'],
+    ['TOUCH', 'Touch screens: drag to aim, on-screen buttons walk, jump and fire.']
   ];
   let y = 152;
   for (const pair of lines) {
@@ -1756,7 +1905,8 @@ function drawHelpOverlay() {
     'Items: Double Shot, Triple Split, Frost Nectar, Leaf Glider, Repair Nectar.',
     'Crates parachute down with items — walk an ant over one to claim it.',
     'Keys: Arrows/WASD move + aim · Q/E power · Space fire · J jump · F flip facing',
-    '1-6 weapons · Tab + U items · Enter end turn · P pause · M mute · H help.'
+    '1-6 weapons · Tab + U items · Enter end turn · P pause · M mute · H help.',
+    'Touch: drag to aim, on-screen buttons walk, jump and fire.'
   ];
   let y = 192;
   for (const line of lines) {
@@ -1771,6 +1921,7 @@ function drawHelpOverlay() {
 // ---------------------------------------------------------------------------
 function draw() {
   G.uiButtons = [];
+  G.touchButtons = [];
   ctx.clearRect(0, 0, W, H);
   if (G.screen === 'title') {
     drawTitle();
